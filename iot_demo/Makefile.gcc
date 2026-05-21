@@ -1,0 +1,71 @@
+# Direct g++ build for Ubuntu/RK3566 and MinGW/MSYS2.
+#
+# Ubuntu:
+#   sudo apt install g++ make libsodium-dev pkg-config
+#   make -f Makefile.gcc
+#
+# MSYS2 MinGW64:
+#   pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-libsodium mingw-w64-x86_64-pkgconf make
+#   make -f Makefile.gcc
+#
+# Standalone MinGW with a prebuilt libsodium:
+#   make -f Makefile.gcc SODIUM_PREFIX=C:/libsodium-win64
+
+CXX ?= g++
+BUILD_DIR ?= build_gcc
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
+CPPFLAGS += -Iinclude
+
+# Prefer pkg-config/pkgconf when available. If SODIUM_PREFIX is provided,
+# it takes precedence and should point to a directory containing include/ and lib/.
+ifdef SODIUM_PREFIX
+  CPPFLAGS += -I$(SODIUM_PREFIX)/include
+  LDLIBS += -L$(SODIUM_PREFIX)/lib -lsodium
+else
+  CPPFLAGS += $(shell pkg-config --cflags libsodium 2>/dev/null)
+  LDLIBS += $(shell pkg-config --libs libsodium 2>/dev/null)
+  ifeq ($(strip $(shell pkg-config --libs libsodium 2>/dev/null)),)
+    LDLIBS += -lsodium
+  endif
+endif
+
+# Windows/MinGW needs Winsock2.
+ifeq ($(OS),Windows_NT)
+  APP_EXT := .exe
+  LDLIBS += -lws2_32
+else
+  APP_EXT :=
+endif
+
+COMMON_SRCS := src/common.cpp src/mincosig.cpp src/net.cpp src/protocol.cpp
+COMMON_OBJS := $(patsubst src/%.cpp,$(BUILD_DIR)/%.o,$(COMMON_SRCS))
+APPS := provision_tool ta_server device_client
+TARGETS := $(addprefix $(BUILD_DIR)/,$(addsuffix $(APP_EXT),$(APPS)))
+
+.PHONY: all clean show
+all: $(TARGETS)
+
+show:
+	@echo CXX=$(CXX)
+	@echo CPPFLAGS=$(CPPFLAGS)
+	@echo CXXFLAGS=$(CXXFLAGS)
+	@echo LDLIBS=$(LDLIBS)
+	@echo TARGETS=$(TARGETS)
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: src/%.cpp | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/provision_tool$(APP_EXT): $(COMMON_OBJS) $(BUILD_DIR)/provision_tool.o
+	$(CXX) $^ $(LDLIBS) -o $@
+
+$(BUILD_DIR)/ta_server$(APP_EXT): $(COMMON_OBJS) $(BUILD_DIR)/ta_server.o
+	$(CXX) $^ $(LDLIBS) -o $@
+
+$(BUILD_DIR)/device_client$(APP_EXT): $(COMMON_OBJS) $(BUILD_DIR)/device_client.o
+	$(CXX) $^ $(LDLIBS) -o $@
+
+clean:
+	rm -rf $(BUILD_DIR)
