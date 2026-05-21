@@ -1,0 +1,139 @@
+free c: channel.
+
+type G.
+type scalar.
+type skey.
+type cshare.
+type token.
+type nonce.
+
+(* --- 1. Diffie-Hellman key agreement --- *)
+const g: G.
+fun exp(G, scalar): G.
+equation forall a: scalar, b: scalar; exp(exp(g, a), b) = exp(exp(g, b), a).
+
+fun hkdf(G, nonce, nonce, nonce): nonce.
+
+(* --- 2. Standard signatures and AEAD --- *)
+fun pk(skey): G.
+fun sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; verify(m, sign(m, k), pk(k)) = true.
+
+fun aead_enc(bitstring, nonce): bitstring.
+reduc forall m: bitstring, k: nonce; aead_dec(aead_enc(m, k), k) = m.
+
+(* --- 3. Collaborative-signing abstraction for EdDSA --- *)
+fun pkshare(cshare): G.
+fun cpub(G, G): G.
+equation forall s1: cshare, s2: cshare; cpub(pkshare(s1), pkshare(s2)) = cpub(pkshare(s2), pkshare(s1)).
+
+(* Server-side partial result; kept abstract/private in the symbolic model. *)
+fun rfinal(cshare, bitstring, G): G [private].
+fun partial2(bitstring, cshare, G, G): bitstring [private].
+fun finish(bitstring, cshare, G): bitstring.
+reduc forall m: bitstring, s1: cshare, s2: cshare, r: G;
+  verifyco(m, finish(partial2(m, s2, pkshare(s1), r), s1, r), cpub(pkshare(s1), pkshare(s2))) = true.
+
+(* --- 4. Public helpers --- *)
+fun hsalt(nonce): bitstring.
+fun xidfun(token, G, nonce, bitstring, nonce, G): nonce.
+fun r1pt(cshare, nonce): G.
+fun mco(nonce, G, G): bitstring.
+
+(* --- 5. Security targets and authentication events --- *)
+free Token: token [private].
+free secret_data: bitstring [private].
+
+query attacker(secret_data).
+
+event begin_D(nonce).
+event accept_D(nonce).
+event begin_TA(nonce).
+event accept_TA(nonce).
+
+query x: nonce; event(accept_D(x)) ==> event(begin_TA(x)).
+query x: nonce; event(accept_TA(x)) ==> event(begin_D(x)).
+
+(* --- 6. Device process --- *)
+let processD(skDef: skey, pkTA: G, pk2: G, salt_d: nonce) =
+    new a: scalar;
+    let Qd = exp(g, a) in
+    new Nd: nonce;
+    new T1: nonce;
+    new sk1: cshare;
+    let pk1 = pkshare(sk1) in
+    let xid = xidfun(Token, Qd, Nd, hsalt(salt_d), T1, pk1) in
+    let R1 = r1pt(sk1, xid) in
+    event begin_D(xid);
+
+    (* M1: xid is no longer sent explicitly *)
+    out(c, (Token, Qd, Nd, hsalt(salt_d), T1, pk1, R1));
+
+    (* M2 *)
+    in(c, (Qs: G, Ns: nonce, T2: nonce, alpha: bitstring, Csalt: bitstring, R: G, S2: bitstring));
+    let Z = exp(Qs, a) in
+    let k_session = hkdf(Z, Nd, Ns, xid) in
+    let (=T2, salt_s_r: nonce) = aead_dec(Csalt, k_session) in
+    if verify((Qs, Qd, Ns, Nd, xid, salt_s_r, T2, pk1, R1, R, S2), alpha, pkTA) = true then (
+        let pub_usr = cpub(pk1, pk2) in
+        let sigma_usr = finish(S2, sk1, R) in
+        if verifyco(mco(xid, pub_usr, pk1), sigma_usr, pub_usr) = true then (
+            new T3: nonce;
+            let beta = sign((pub_usr, pk1, Qd, Qs, Nd, Ns, xid, T3), skDef) in
+            (* M3 *)
+            out(c, (xid, aead_enc((beta, sigma_usr, T3, secret_data), k_session)));
+
+            (* M4 *)
+            in(c, (AckMsg: bitstring));
+            let (=T3, T4: nonce) = aead_dec(AckMsg, k_session) in
+            event accept_D(xid)
+        )
+    ).
+
+(* --- 7. Management-center process --- *)
+let processTA(skTA: skey, skDef: skey, sk2: cshare, salt_d: nonce) =
+    let pk2 = pkshare(sk2) in
+    in(c, (tok_r: token, Qd_r: G, Nd_r: nonce, hsd_r: bitstring, T1_r: nonce, pk1_r: G, R1_r: G));
+    if tok_r = Token then
+    if hsd_r = hsalt(salt_d) then (
+        let xid_r = xidfun(tok_r, Qd_r, Nd_r, hsd_r, T1_r, pk1_r) in
+        event begin_TA(xid_r);
+        new b: scalar;
+        let Qs = exp(g, b) in
+        new Ns: nonce;
+        new T2: nonce;
+        new salt_s: nonce;
+        let k_session = hkdf(exp(Qd_r, b), Nd_r, Ns, xid_r) in
+        let Csalt = aead_enc((T2, salt_s), k_session) in
+        let pub_usr = cpub(pk1_r, pk2) in
+        let m_co = mco(xid_r, pub_usr, pk1_r) in
+        let R = rfinal(sk2, m_co, R1_r) in
+        let S2 = partial2(m_co, sk2, pk1_r, R) in
+        let alpha = sign((Qs, Qd_r, Ns, Nd_r, xid_r, salt_s, T2, pk1_r, R1_r, R, S2), skTA) in
+
+        (* M2 *)
+        out(c, (Qs, Ns, T2, alpha, Csalt, R, S2));
+
+        (* M3 *)
+        in(c, (xid_r2: nonce, C3: bitstring));
+        if xid_r2 = xid_r then (
+            let (beta_r: bitstring, sigma_r: bitstring, T3_r: nonce, secret_data_r: bitstring) = aead_dec(C3, k_session) in
+            if verify((pub_usr, pk1_r, Qd_r, Qs, Nd_r, Ns, xid_r, T3_r), beta_r, pk(skDef)) = true then
+            if verifyco(mco(xid_r, pub_usr, pk1_r), sigma_r, pub_usr) = true then (
+                new T4: nonce;
+                out(c, (aead_enc((T3_r, T4), k_session)));
+                event accept_TA(xid_r)
+            )
+        )
+    ).
+
+process
+    new skTA: skey;
+    new skDef: skey;
+    new sk2: cshare;
+    new salt_d: nonce;
+    let pkTA = pk(skTA) in
+    let pk2 = pkshare(sk2) in
+    out(c, pkTA);
+    out(c, pk2);
+    ((!processD(skDef, pkTA, pk2, salt_d)) | (!processTA(skTA, skDef, sk2, salt_d)))
